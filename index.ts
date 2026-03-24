@@ -33,15 +33,15 @@ type ActiveOwner = {
 };
 
 const STATUS_ID = "pi-voxtype-status";
-const LEGACY_WIDGET_ID = "pi-voxtype-widget";
+const WIDGET_ID = "pi-voxtype-widget";
 const CONFIG_ENTRY = "pi-voxtype-config";
 const POLL_MS = 350;
-const DEFAULT_SHORTCUT = process.env.PI_VOXTYPE_SHORTCUT?.trim() || process.env.PI_VOICE_SHORTCUT?.trim() || "alt+space";
+const DEFAULT_SHORTCUT = process.env.PI_VOXTYPE_SHORTCUT?.trim() || "alt+space";
 const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 1000}`;
 const VOICE_RUNTIME_DIR = join(runtimeDir, "pi-voxtype");
 const ACTIVE_OWNER_FILE = join(VOICE_RUNTIME_DIR, "active-owner.json");
-const DEFAULT_INBOX_ENV = process.env.PI_VOXTYPE_INBOX || process.env.PI_VOICE_INBOX;
-const LEGACY_DEFAULT_INBOX_FILE = DEFAULT_INBOX_ENV || join(VOICE_RUNTIME_DIR, "inbox.txt");
+const DEFAULT_INBOX_ENV = process.env.PI_VOXTYPE_INBOX;
+const DEFAULT_INBOX_FILE = DEFAULT_INBOX_ENV || join(VOICE_RUNTIME_DIR, "inbox.txt");
 
 function expandHome(path: string): string {
 	if (path === "~") return os.homedir();
@@ -49,7 +49,7 @@ function expandHome(path: string): string {
 	return path;
 }
 
-function resolveInboxFile(path?: string, fallbackPath = LEGACY_DEFAULT_INBOX_FILE): string {
+function resolveInboxFile(path?: string, fallbackPath = DEFAULT_INBOX_FILE): string {
 	const next = path?.trim() || fallbackPath;
 	return resolve(expandHome(next));
 }
@@ -113,7 +113,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	let currentCtx: ExtensionContext | undefined;
 	let enabled = false;
 	let busyMode: BusyMode = "followUp";
-	let sessionDefaultInboxFile = LEGACY_DEFAULT_INBOX_FILE;
+	let sessionDefaultInboxFile = DEFAULT_INBOX_FILE;
 	let inboxFile = resolveInboxFile(undefined, sessionDefaultInboxFile);
 	let voxtypeStateFile = resolveVoxtypeStateFile();
 	let voxtypeState: VoiceState = "idle";
@@ -124,9 +124,9 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	let lastStateMtimeMs = 0;
 	let lastOwnerSignature = "";
 
-	const clearLegacyUi = () => {
+	const clearWidgetUi = () => {
 		if (!currentCtx?.hasUI) return;
-		currentCtx.ui.setWidget(LEGACY_WIDGET_ID, undefined);
+		currentCtx.ui.setWidget(WIDGET_ID, undefined);
 	};
 
 	const readActiveOwner = (): ActiveOwner | undefined => {
@@ -164,7 +164,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 
 	const applyUi = () => {
 		if (!currentCtx?.hasUI) return;
-		clearLegacyUi();
+		clearWidgetUi();
 		const shouldShow = enabled && voxtypeState !== "idle" && isCurrentSessionActiveOwner();
 		currentCtx.ui.setStatus(STATUS_ID, shouldShow ? voiceIcon(voxtypeState) : undefined);
 	};
@@ -212,13 +212,9 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			const data = entry.data as PersistedConfig;
 			enabled = Boolean(data.enabled);
 			busyMode = data.busyMode === "steer" ? "steer" : "followUp";
-
-			const persistedInboxFile = data.inboxFile
+			inboxFile = data.inboxFile
 				? resolveInboxFile(data.inboxFile, sessionDefaultInboxFile)
 				: sessionDefaultInboxFile;
-			const shouldMigrateLegacyInbox =
-				!DEFAULT_INBOX_ENV?.trim() && persistedInboxFile === resolveInboxFile(undefined, LEGACY_DEFAULT_INBOX_FILE);
-			inboxFile = shouldMigrateLegacyInbox ? sessionDefaultInboxFile : persistedInboxFile;
 		}
 
 		armInboxSnapshot();
@@ -394,7 +390,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		ctx.ui.setStatus(STATUS_ID, undefined);
-		ctx.ui.setWidget(LEGACY_WIDGET_ID, undefined);
+		ctx.ui.setWidget(WIDGET_ID, undefined);
 		stopPolling();
 	});
 
