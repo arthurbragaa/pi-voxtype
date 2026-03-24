@@ -1,0 +1,27 @@
+{
+  "name": "pi-voxtype",
+  "version": "0.1.0",
+  "description": "Voxtype bridge for pi with direct session-scoped voice submission",
+  "keywords": ["pi-package", "pi-extension", "voxtype", "voice", "speech-to-text"],
+  "license": "MIT",
+  "author": "Arthur Braga",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/arthurbragaa/pi-voxtype.git"
+  },
+  "homepage": "https://github.com/arthurbragaa/pi-voxtype#readme",
+  "bugs": {
+    "url": "https://github.com/arthurbragaa/pi-voxtype/issues"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
