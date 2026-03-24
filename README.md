@@ -56,10 +56,7 @@ The shortcut auto-enables the bridge for the current session.
 - `/voice off`
 - `/voice steer`
 - `/voice followup`
-- `/voice path <file>`
-- `/voice setup`
 - `/voice doctor`
-- `/voice test [text]`
 
 Default busy behavior: `followUp`.
 
@@ -85,21 +82,6 @@ ${XDG_RUNTIME_DIR}/pi-voxtype/<session-hash>.inbox.txt
 ```
 
 Each pi session gets its own inbox by default, so one recording is not sent to every open pi session.
-
-## Compositor binding example
-
-If you prefer compositor-level push-to-talk instead of the in-pi shortcut:
-
-```ini
-bind = SUPER, V, exec, sh -lc 'mkdir -p "$XDG_RUNTIME_DIR/pi-voxtype"; : > "$XDG_RUNTIME_DIR/pi-voxtype/inbox.txt"; voxtype record start --file="$XDG_RUNTIME_DIR/pi-voxtype/inbox.txt"'
-bindr = SUPER, V, exec, voxtype record stop
-```
-
-Then enable the bridge in pi:
-
-```text
-/voice on
-```
 
 ## Troubleshooting
 

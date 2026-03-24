@@ -368,7 +368,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			notes.push(`inbox writable: ${inboxFile}`);
 		} catch (error) {
 			issues.push(`cannot write inbox file: ${error instanceof Error ? error.message : String(error)}`);
-			actions.push("Choose another path with `/voice path <file>` or fix permissions on the runtime directory.");
+			actions.push("Set `PI_VOXTYPE_INBOX` to another file or fix permissions on the runtime directory.");
 		}
 
 		return { issues, notes, actions };
@@ -406,7 +406,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	pi.registerCommand("voice", {
 		description: "Bridge voxtype transcripts into pi",
 		getArgumentCompletions: (prefix) => {
-			const args = ["status", "toggle", "on", "off", "setup", "doctor", "steer", "followup", "path", "test"];
+			const args = ["status", "toggle", "on", "off", "doctor", "steer", "followup"];
 			const filtered = args.filter((value) => value.startsWith(prefix.trim().toLowerCase()));
 			return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
 		},
@@ -448,28 +448,6 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 					ctx.ui.notify("Voice busy mode set to follow-up", "info");
 					return;
 				}
-				case "path": {
-					if (rest.length === 0) {
-						ctx.ui.notify(`Voice inbox: ${inboxFile}`, "info");
-						return;
-					}
-					if (voxtypeState !== "idle") {
-						ctx.ui.notify("Cannot change inbox while recording or transcribing.", "warning");
-						return;
-					}
-					inboxFile = resolveInboxFile(rest.join(" "), sessionDefaultInboxFile);
-					armInboxSnapshot();
-					persistConfig();
-					ctx.ui.notify(`Voice inbox set to ${inboxFile}`, "success");
-					return;
-				}
-				case "setup": {
-					ctx.ui.notify(
-						`Shortcut: ${shortcutLabel()}. Busy mode: ${busyMode === "followUp" ? "follow-up" : "steer"}. Inbox: ${inboxFile}. Start: ${getStartCommand()} Stop: ${getStopCommand()}`,
-						"info",
-					);
-					return;
-				}
 				case "doctor": {
 					const report = await runDoctor();
 					const lines = [
@@ -479,10 +457,6 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 						...report.actions.map((action) => `- NEXT: ${action}`),
 					];
 					ctx.ui.notify(lines.join("\n"), report.issues.length === 0 ? "success" : "warning");
-					return;
-				}
-				case "test": {
-					sendTranscript(rest.join(" ").trim() || "Voice bridge test.");
 					return;
 				}
 				case "status":
