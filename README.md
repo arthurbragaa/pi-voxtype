@@ -35,24 +35,10 @@ voxtype status --format json --extended
 
 ## Install
 
-### Local path
-
-```bash
-pi install /absolute/path/to/pi-voxtype
-```
-
-### npm or git
-
 ```bash
 pi install npm:pi-voxtype
 # or
 pi install git:github.com/arthurbragaa/pi-voxtype
-```
-
-Then inside pi:
-
-```text
-/reload
 ```
 
 ## Default usage
