@@ -1,0 +1,121 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,7 +3,7 @@
+ 
+ [package]
+ name = "voxtype"
+-version = "1.0.1"
++version = "1.0.1+pi.1"
+ edition = "2021"
+ authors = ["Peter Jackson", "Jean-Paul van Tillo", "Máté Rémiás", "Rob Zolkos", "Dan Heuckeroth", "Igor Warzocha", "Julian Kaiser", "Kevin Miller", "konnsim", "reisset", "Zubair", "Loki Coyote", "Umesh", "Barrett Ruth", "André Silva", "Chmouel Boudjnah", "Christopher Albert", "Phuoc Thinh Vu", "Alexander Bosu-Kellett", "ayoahha", "Toizi", "kakapt", "Rinor Maloku", "Sami Jawhar", "jan Lemata", "Kai Stark", "graysky"]
+ description = "Push-to-talk voice-to-text for Wayland"
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -5942,7 +5942,7 @@
+ 
+ [[package]]
+ name = "voxtype"
+-version = "1.0.1"
++version = "1.0.1+pi.1"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -262,6 +262,9 @@
+     let pending = std::fs::read_to_string(&override_file).ok();
+     match pending.as_deref().map(str::trim) {
+         Some(value) => {
++            if value == "file" {
++                return config.output.file_path.clone();
++            }
+             if let Some(path) = value.strip_prefix("file:") {
+                 let path = path.trim();
+                 if !path.is_empty() {
+@@ -279,6 +282,17 @@
+                 None
+             }
+         }
++    }
++}
++
++/// File clients need one complete transcript, not live keyboard output.
++/// Inspect overrides without consuming them; the batch output path owns them.
++fn file_output_requested(config: &Config, pending: Option<&str>) -> bool {
++    match pending.map(str::trim) {
++        Some("file") => true,
++        Some(value) if value.starts_with("file:") => true,
++        Some("type" | "clipboard" | "paste") => false,
++        _ => config.output.mode == OutputMode::File,
+     }
+ }
+ 
+@@ -1156,6 +1170,15 @@
+         // an is_recording() state, so a leftover cancel file would kill the
+         // session moments after it starts. See #606.
+         cleanup_cancel_file();
++        let pending_output =
++            std::fs::read_to_string(Config::runtime_dir().join("output_mode_override")).ok();
++        if file_output_requested(&self.config, pending_output.as_deref()) {
++            // The streaming output chain ignores per-recording --file and would
++            // type into whichever application has focus. Keep the same loaded
++            // model, but use its batch transcribe() path and atomic file output.
++            tracing::debug!("File output requested; buffering the streaming model's input");
++            return false;
++        }
+         let Some(transcriber) = transcriber_preloaded.as_ref() else {
+             return false;
+         };
+@@ -3599,11 +3622,9 @@
+                             max_duration.as_secs_f32()
+                         );
+ 
+-                        cleanup_output_mode_override();
+-                        cleanup_model_override();
+-                        cleanup_profile_override();
+-                        cleanup_bool_override("smart_auto_submit");
+-
++                        // A duration limit is a normal stop, not cancellation.
++                        // Preserve --file and other overrides for the transcript
++                        // delivery path; dropping them would type into the desktop.
+                         let model_override = match &state {
+                             State::Recording { model_override, .. } => model_override.clone(),
+                             State::EagerRecording { model_override, .. } => model_override.clone(),
+@@ -4288,6 +4309,26 @@
+     }
+ 
+     #[test]
++    fn file_clients_bypass_live_streaming_output() {
++        let mut config = Config::default();
++        for pending in [
++            "file",
++            "file:",
++            "file:/tmp/pi.inbox.txt",
++            "  file:/tmp/pi.inbox.txt\n",
++        ] {
++            assert!(file_output_requested(&config, Some(pending)));
++        }
++        assert!(!file_output_requested(&config, None));
++        config.output.mode = OutputMode::File;
++        assert!(file_output_requested(&config, None));
++        // Explicit non-file overrides still allow desktop streaming.
++        for pending in ["type", "clipboard", "paste"] {
++            assert!(!file_output_requested(&config, Some(pending)));
++        }
++    }
++
++    #[test]
+     fn overwrite_is_atomic_from_a_readers_point_of_view() {
+         // A reader that polls for a non-empty transcript must never observe a
+         // partial one, so the staged file must not be the target path and the
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -1790,6 +1790,8 @@
+     json!({
+         "schema_version": SCHEMA_VERSION,
+         "voxtype_version": env!("CARGO_PKG_VERSION"),
++        // CLI-build capability. Clients must also check daemon_version matches.
++        "capabilities": { "streaming_file_output": true },
+         "daemon_version": daemon.version(),
+         "daemon_version_label": daemon.describe(),
+         "daemon_version_differs": daemon.differs_from_caller(),

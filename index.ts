@@ -1,11 +1,11 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import os from "node:os";
 
 type BusyMode = "steer" | "followUp";
-type VoiceState = "idle" | "recording" | "transcribing";
+type VoiceState = "idle" | "recording" | "streaming" | "transcribing" | "unknown";
 
 type PersistedConfig = {
 	enabled?: boolean;
@@ -85,18 +85,24 @@ function resolveVoxtypeStateFile(): string | undefined {
 
 function normalizeVoiceState(value: string | undefined): VoiceState {
 	switch ((value || "").trim()) {
+		case "idle":
+			return "idle";
 		case "recording":
 			return "recording";
+		case "streaming":
+			return "streaming";
 		case "transcribing":
+		case "outputting":
 			return "transcribing";
 		default:
-			return "idle";
+			return "unknown";
 	}
 }
 
 function voiceIcon(state: VoiceState): string {
 	switch (state) {
 		case "recording":
+		case "streaming":
 			return "🎤";
 		case "transcribing":
 			return "⏳";
@@ -119,10 +125,12 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	let voxtypeState: VoiceState = "idle";
 
 	let pollHandle: NodeJS.Timeout | undefined;
-	let lastInboxMtimeMs = 0;
-	let lastInboxContent = "";
-	let lastStateMtimeMs = 0;
+	let lastCompletionMtimeMs = 0;
 	let lastOwnerSignature = "";
+	let commandInFlight = false;
+	let lastToggleAt = -Infinity;
+	let ignoreCompletions = false;
+	let disposed = false;
 
 	const clearWidgetUi = () => {
 		if (!currentCtx?.hasUI) return;
@@ -145,7 +153,9 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			pid: process.pid,
 			updatedAt: new Date().toISOString(),
 		};
-		writeFileSync(ACTIVE_OWNER_FILE, JSON.stringify(owner, null, 2));
+		const temporary = `${ACTIVE_OWNER_FILE}.${process.pid}.tmp`;
+		writeFileSync(temporary, JSON.stringify(owner, null, 2), { mode: 0o600 });
+		renameSync(temporary, ACTIVE_OWNER_FILE);
 		lastOwnerSignature = `${owner.inboxFile}:${owner.updatedAt}`;
 	};
 
@@ -179,24 +189,18 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 
 	const armInboxSnapshot = () => {
 		try {
-			const stats = statSync(inboxFile);
-			lastInboxMtimeMs = stats.mtimeMs;
-			lastInboxContent = readFileSync(inboxFile, "utf8");
+			lastCompletionMtimeMs = statSync(`${inboxFile}.done`).mtimeMs;
 		} catch {
-			lastInboxMtimeMs = 0;
-			lastInboxContent = "";
+			lastCompletionMtimeMs = 0;
 		}
 	};
 
 	const readVoxtypeState = (): VoiceState => {
-		if (!voxtypeStateFile) return "idle";
-
+		if (!voxtypeStateFile) return "unknown";
 		try {
-			const stats = statSync(voxtypeStateFile);
-			if (stats.mtimeMs !== lastStateMtimeMs) lastStateMtimeMs = stats.mtimeMs;
-			return normalizeVoiceState(readFileSync(voxtypeStateFile, "utf8").trim());
+			return normalizeVoiceState(readFileSync(voxtypeStateFile, "utf8"));
 		} catch {
-			return "idle";
+			return "unknown";
 		}
 	};
 
@@ -242,7 +246,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	};
 
 	const poll = () => {
-		if (!currentCtx) return;
+		if (!currentCtx || disposed || commandInFlight) return;
 
 		const owner = readActiveOwner();
 		const ownerSignature = owner ? `${owner.inboxFile}:${owner.updatedAt}` : "";
@@ -250,26 +254,32 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 		if (nextState !== voxtypeState || ownerSignature !== lastOwnerSignature) {
 			voxtypeState = nextState;
 			lastOwnerSignature = ownerSignature;
-			if (voxtypeState === "idle") clearActiveOwnerIfCurrent();
 			applyUi();
 		}
 
-		if (!enabled) return;
+		if (!enabled || ignoreCompletions) return;
 
 		try {
-			const stats = statSync(inboxFile);
-			if (stats.mtimeMs <= lastInboxMtimeMs) return;
-
-			const nextContent = readFileSync(inboxFile, "utf8");
-			const delta = nextContent.startsWith(lastInboxContent)
-				? nextContent.slice(lastInboxContent.length)
-				: nextContent;
-
-			lastInboxMtimeMs = stats.mtimeMs;
-			lastInboxContent = nextContent;
-			sendTranscript(delta);
+			// Voxtype >=1.0 publishes this atomically AFTER the full transcript.
+			// Never submit incremental file writes or individual streaming chunks.
+			const completionFile = `${inboxFile}.done`;
+			const stats = statSync(completionFile);
+			if (stats.mtimeMs === lastCompletionMtimeMs) return;
+			const outcome = JSON.parse(readFileSync(completionFile, "utf8"));
+			if (!["ok", "empty", "error"].includes(outcome.status)) return;
+			const text = outcome.status === "ok" ? readFileSync(inboxFile, "utf8") : "";
+			lastCompletionMtimeMs = stats.mtimeMs;
+			clearActiveOwnerIfCurrent();
+			applyUi();
+			if (outcome.status === "error") {
+				currentCtx.ui.notify(`Voice transcription failed: ${outcome.message || "unknown error"}`, "error");
+			} else if (outcome.status === "empty") {
+				currentCtx.ui.notify("No speech detected", "info");
+			} else {
+				sendTranscript(text);
+			}
 		} catch {
-			// Inbox appears only after the first recording starts.
+			// No completion yet (or a failed read); retry on the next poll.
 		}
 	};
 
@@ -300,33 +310,122 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 
 	const prepareInbox = () => {
 		mkdirSync(dirname(inboxFile), { recursive: true });
-		writeFileSync(inboxFile, "");
+		rmSync(`${inboxFile}.done`, { force: true });
+		writeFileSync(inboxFile, "", { mode: 0o600 });
+		ignoreCompletions = false;
 		armInboxSnapshot();
 	};
 
-	const getStartCommand = () => `voxtype record start --file=${shQuote(inboxFile)}`;
-	const getStopCommand = () => "voxtype record stop";
+	const checkFileTransport = async (): Promise<string | undefined> => {
+		const result = await runShellCommand("voxtype config schema --json");
+		if (!result.ok) return "Voxtype >=1.0 is required for completed transcript delivery.";
+		try {
+			const schema = JSON.parse(result.stdout || "{}");
+			if (!schema.daemon_version) return "Voxtype daemon is not running.";
+			// The schema describes the CLI's config, not an older daemon's config.
+			if (schema.daemon_version !== schema.voxtype_version) {
+				return "Voxtype CLI and daemon versions differ; restart voxtype first.";
+			}
+			const value = (key: string) => schema.keys?.find((entry: { key: string }) => entry.key === key)?.value;
+			const streaming = (schema.engine === "parakeet" && value("parakeet.streaming") === true)
+				|| (schema.engine === "soniox" && value("soniox.async_api") !== true);
+			if (streaming && schema.capabilities?.streaming_file_output !== true) {
+				return "This Voxtype build bypasses --file when streaming. Use the streaming-file-output compatibility build or a non-streaming model.";
+			}
+		} catch {
+			return "Cannot read Voxtype's config schema; refusing to start an unverified file recording.";
+		}
+		return undefined;
+	};
 
-	const toggleRecording = async (ctx: ExtensionContext) => {
-		currentCtx = ctx;
-		ensurePolling();
-		enabled = true;
-		persistConfig();
-
-		const action = voxtypeState === "recording" ? "stop" : "start";
-		if (action === "start") prepareInbox();
-
-		const result = await runShellCommand(action === "stop" ? getStopCommand() : getStartCommand());
-		if (result.ok) {
-			if (action === "start") writeActiveOwner();
-			voxtypeState = action === "start" ? "recording" : "transcribing";
-			applyUi();
+	const cancelRecording = async (ctx: ExtensionContext) => {
+		if (commandInFlight) {
+			ctx.ui.notify("Voice start/stop is still in progress; retry /voice cancel shortly.", "warning");
 			return;
 		}
+		ignoreCompletions = true; // A late result must never be submitted after cancel.
+		if (!isCurrentSessionActiveOwner()) return;
+		commandInFlight = true;
+		try {
+			const result = await runShellCommand("voxtype record cancel");
+			if (!result.ok) {
+				ctx.ui.notify(`Voice cancel failed: ${result.error}`, "error");
+				return;
+			}
+			clearActiveOwnerIfCurrent();
+			voxtypeState = readVoxtypeState();
+			applyUi();
+		} finally {
+			commandInFlight = false;
+		}
+	};
 
-		applyUi();
-		if (ctx.hasUI) {
-			ctx.ui.notify(`Voice ${action} failed: ${result.error || "unknown error"}`, "error");
+	const toggleRecording = async (ctx: ExtensionContext) => {
+		const now = Date.now();
+		const repeated = now - lastToggleAt < 750;
+		lastToggleAt = now; // Holding the shortcut extends the debounce window.
+		if (disposed || commandInFlight || repeated) return;
+		currentCtx = ctx;
+		ensurePolling();
+		// Read now, not the potentially stale state from the 350ms poll.
+		voxtypeState = readVoxtypeState();
+		if (voxtypeState === "unknown") {
+			ctx.ui.notify("Cannot read Voxtype state. Run /voice doctor before recording.", "warning");
+			return;
+		}
+		if (voxtypeState === "transcribing") {
+			ctx.ui.notify("Voice is still transcribing. Wait, or use /voice cancel.", "info");
+			return;
+		}
+		const action = voxtypeState === "recording" || voxtypeState === "streaming" ? "stop" : "start";
+		if (action === "stop" && !isCurrentSessionActiveOwner()) {
+			ctx.ui.notify("That recording belongs to another pi session or desktop dictation.", "warning");
+			return;
+		}
+		// Deliver a just-finished take before preparing (and truncating) its inbox.
+		if (action === "start") poll();
+		commandInFlight = true;
+		try {
+			if (action === "start") {
+				const issue = await checkFileTransport();
+				if (disposed) return;
+				if (issue) {
+					ctx.ui.notify(issue, "warning");
+					return;
+				}
+				// Another client may have started while the preflight was running.
+				if (readVoxtypeState() !== "idle") {
+					ctx.ui.notify("Voxtype became busy; try again after that recording finishes.", "warning");
+					return;
+				}
+				prepareInbox();
+				writeActiveOwner();
+			}
+			enabled = true;
+			persistConfig();
+			const command = action === "start"
+				? `voxtype record start --no-auto-submit --file=${shQuote(inboxFile)}`
+				: "voxtype record stop";
+			const result = await runShellCommand(command);
+			if (disposed) {
+				if (isCurrentSessionActiveOwner()) {
+					await runShellCommand("voxtype record cancel");
+					clearActiveOwnerIfCurrent();
+				}
+				return;
+			}
+			if (!result.ok) {
+				if (action === "start") clearActiveOwnerIfCurrent();
+				ctx.ui.notify(`Voice ${action} failed: ${result.error || "unknown error"}`, "error");
+				return;
+			}
+			voxtypeState = action === "start" ? "recording" : "transcribing";
+			applyUi();
+		} catch (error) {
+			if (action === "start") clearActiveOwnerIfCurrent();
+			ctx.ui.notify(`Voice ${action} failed: ${String(error)}`, "error");
+		} finally {
+			commandInFlight = false;
 		}
 	};
 
@@ -342,6 +441,9 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			return { issues, notes, actions };
 		}
 		notes.push("voxtype found on PATH.");
+		const transportIssue = await checkFileTransport();
+		if (transportIssue) issues.push(transportIssue);
+		else notes.push("Completed file transcript delivery is supported by the running daemon.");
 
 		const status = await runShellCommand("voxtype status --format json >/dev/null 2>&1");
 		if (status.ok) {
@@ -382,16 +484,19 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 		ensurePolling();
 	});
 
-	pi.on("session_switch", async (_event, ctx) => {
-		currentCtx = ctx;
-		loadConfig(ctx);
-		ensurePolling();
-	});
-
 	pi.on("session_shutdown", async (_event, ctx) => {
+		disposed = true;
+		ignoreCompletions = true;
+		stopPolling();
+		// session_start is re-fired for resume/fork/reload by current pi.
+		// Never leave an owned microphone recording behind when its session exits.
+		if (!commandInFlight && isCurrentSessionActiveOwner()) {
+			await runShellCommand("voxtype record cancel");
+			clearActiveOwnerIfCurrent();
+		}
 		ctx.ui.setStatus(STATUS_ID, undefined);
 		ctx.ui.setWidget(WIDGET_ID, undefined);
-		stopPolling();
+		currentCtx = undefined;
 	});
 
 	if (shortcutLabel() !== "disabled") {
@@ -406,7 +511,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	pi.registerCommand("voice", {
 		description: "Bridge voxtype transcripts into pi",
 		getArgumentCompletions: (prefix) => {
-			const args = ["status", "toggle", "on", "off", "doctor", "steer", "followup"];
+			const args = ["status", "toggle", "cancel", "on", "off", "doctor", "steer", "followup"];
 			const filtered = args.filter((value) => value.startsWith(prefix.trim().toLowerCase()));
 			return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
 		},
@@ -414,21 +519,27 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			currentCtx = ctx;
 			ensurePolling();
 
-			const [command = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			const [command = "status"] = args.trim().split(/\s+/).filter(Boolean);
 			switch (command.toLowerCase()) {
 				case "toggle": {
 					await toggleRecording(ctx);
 					return;
 				}
+				case "cancel": {
+					await cancelRecording(ctx);
+					return;
+				}
 				case "on": {
 					enabled = true;
+					ignoreCompletions = false;
 					armInboxSnapshot();
 					persistConfig();
 					applyUi();
-					ctx.ui.notify("Voice bridge enabled", "success");
+					ctx.ui.notify("Voice bridge enabled", "info");
 					return;
 				}
 				case "off": {
+					await cancelRecording(ctx);
 					enabled = false;
 					persistConfig();
 					applyUi();
@@ -456,7 +567,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 						...report.issues.map((issue) => `- ISSUE: ${issue}`),
 						...report.actions.map((action) => `- NEXT: ${action}`),
 					];
-					ctx.ui.notify(lines.join("\n"), report.issues.length === 0 ? "success" : "warning");
+					ctx.ui.notify(lines.join("\n"), report.issues.length === 0 ? "info" : "warning");
 					return;
 				}
 				case "status":

@@ -1,6 +1,10 @@
 {
   "name": "pi-voxtype",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "description": "Voxtype bridge for pi with direct session-scoped voice submission",
   "keywords": ["pi-package", "pi-extension", "voxtype", "voice", "speech-to-text"],
   "license": "MIT",
@@ -15,6 +19,7 @@
   },
   "files": [
     "index.ts",
+    "compat/",
     "README.md",
     "LICENSE"
   ],
@@ -22,6 +27,6 @@
     "extensions": ["./index.ts"]
   },
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*"
   }
 }
