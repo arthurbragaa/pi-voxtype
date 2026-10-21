@@ -1,0 +1,57 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,7 +3,7 @@
+ 
+ [package]
+ name = "voxtype"
+-version = "1.1.0"
++version = "1.1.0+pi.1"
+ edition = "2021"
+ authors = ["Peter Jackson", "Jean-Paul van Tillo", "Máté Rémiás", "Rob Zolkos", "Dan Heuckeroth", "Igor Warzocha", "Julian Kaiser", "Kevin Miller", "konnsim", "reisset", "Zubair", "Loki Coyote", "Umesh", "Barrett Ruth", "André Silva", "Chmouel Boudjnah", "Christopher Albert", "Phuoc Thinh Vu", "Alexander Bosu-Kellett", "ayoahha", "Toizi", "kakapt", "Rinor Maloku", "Sami Jawhar", "jan Lemata", "Kai Stark", "graysky"]
+ description = "Push-to-talk voice-to-text for Wayland"
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -6095,7 +6095,7 @@
+ 
+ [[package]]
+ name = "voxtype"
+-version = "1.1.0"
++version = "1.1.0+pi.1"
+ dependencies = [
+  "anyhow",
+  "async-trait",
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -1585,6 +1585,14 @@
+                         FileMode::Append => "appended",
+                     };
+                     tracing::info!("{} streamed transcription to {:?}", mode_str, output_path);
++                    // Publish the same completion contract as batch file output,
++                    // after the final transcript is atomically available.
++                    let outcome = if final_text.trim().is_empty() {
++                        TranscriptOutcome::empty()
++                    } else {
++                        TranscriptOutcome::ok(final_text.chars().count())
++                    };
++                    write_result_sidecar(&output_path, &outcome);
+                     self.play_feedback(SoundEvent::TranscriptionComplete);
+                 }
+                 Err(e) => {
+@@ -1593,6 +1601,7 @@
+                         output_path,
+                         e
+                     );
++                    write_result_sidecar(&output_path, &TranscriptOutcome::error(&e.to_string()));
+                 }
+             }
+ 
+--- a/src/config/schema.rs
++++ b/src/config/schema.rs
+@@ -1956,6 +1956,7 @@
+     json!({
+         "schema_version": SCHEMA_VERSION,
+         "voxtype_version": env!("CARGO_PKG_VERSION"),
++        "capabilities": { "streaming_file_output": true },
+         "daemon_version": daemon.version(),
+         "daemon_version_label": daemon.describe(),
+         "daemon_version_differs": daemon.differs_from_caller(),

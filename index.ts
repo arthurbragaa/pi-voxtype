@@ -1,5 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { createHash } from "node:crypto";
+import { Text } from "@earendil-works/pi-tui";
+import { createHash, randomUUID } from "node:crypto";
+import { appendHistory, displayText, getHistoryDir, readRecentHistory, type DictationRecord } from "./history.ts";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import os from "node:os";
@@ -35,6 +37,7 @@ type ActiveOwner = {
 const STATUS_ID = "pi-voxtype-status";
 const WIDGET_ID = "pi-voxtype-widget";
 const CONFIG_ENTRY = "pi-voxtype-config";
+const DICTATION_ENTRY = "pi-voxtype-dictation";
 const POLL_MS = 350;
 const DEFAULT_SHORTCUT = process.env.PI_VOXTYPE_SHORTCUT?.trim() || "alt+space";
 const runtimeDir = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? 1000}`;
@@ -131,6 +134,8 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	let lastToggleAt = -Infinity;
 	let ignoreCompletions = false;
 	let disposed = false;
+	let recordingMetadata: DictationRecord["voxtype"];
+	const persistenceWarnings = new Set<string>();
 
 	const clearWidgetUi = () => {
 		if (!currentCtx?.hasUI) return;
@@ -226,22 +231,61 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 		applyUi();
 	};
 
-	const sendTranscript = (text: string) => {
-		if (!currentCtx) return;
-
+	const sendTranscript = (text: string): Pick<DictationRecord, "delivery" | "busyMode" | "error"> => {
 		const trimmed = text.trim();
-		if (!trimmed) return;
-
+		if (!currentCtx || !trimmed) return { delivery: "not-submitted", busyMode: null };
 		try {
 			if (currentCtx.isIdle()) {
 				pi.sendUserMessage(trimmed);
-			} else {
-				pi.sendUserMessage(trimmed, { deliverAs: busyMode });
+				return { delivery: "submitted", busyMode: null };
 			}
+			pi.sendUserMessage(trimmed, { deliverAs: busyMode });
+			return { delivery: "queued", busyMode };
 		} catch (error) {
-			if (!currentCtx.hasUI) return;
 			const message = error instanceof Error ? error.message : String(error);
-			currentCtx.ui.notify(`Voice send failed: ${message}`, "error");
+			if (currentCtx.hasUI) currentCtx.ui.notify(`Voice send failed: ${message}`, "error");
+			return { delivery: "failed", busyMode: null, error: message };
+		}
+	};
+
+	const warnPersistence = (kind: string, error: unknown) => {
+		if (persistenceWarnings.has(kind)) return;
+		persistenceWarnings.add(kind);
+		if (currentCtx?.hasUI) currentCtx.ui.notify(`Could not save dictation ${kind}: ${error}. Voice delivery continues.`, "warning");
+	};
+
+	const recordDictation = (outcome: DictationRecord["outcome"], transcript: string, error?: string) => {
+		if (!currentCtx) return;
+		const delivery: Pick<DictationRecord, "delivery" | "busyMode" | "error"> = outcome === "ok"
+			? sendTranscript(transcript) : { delivery: "not-submitted", busyMode: null };
+		const record: DictationRecord = {
+			schemaVersion: 1,
+			id: randomUUID(),
+			timestamp: new Date().toISOString(),
+			source: "dictation",
+			scope: "pi",
+			sessionId: currentCtx.sessionManager.getSessionId(),
+			sessionFile: currentCtx.sessionManager.getSessionFile() || null,
+			cwd: currentCtx.cwd || null,
+			outcome,
+			...delivery,
+			transcript,
+			submittedText: outcome === "ok" && delivery.delivery !== "failed" ? transcript.trim() : "",
+			...(error || delivery.error ? { error: error || delivery.error } : {}),
+			voxtype: recordingMetadata,
+		};
+		try {
+			appendHistory(record);
+		} catch (error) {
+			warnPersistence("history", error);
+		}
+		try {
+			// Custom entries and labels are durable UI provenance, never model context.
+			pi.appendEntry(DICTATION_ENTRY, record);
+			const entryId = currentCtx.sessionManager.getLeafId();
+			if (entryId) pi.setLabel(entryId, "🎙 Dictation");
+		} catch (error) {
+			warnPersistence("session marker", error);
 		}
 	};
 
@@ -271,12 +315,11 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			lastCompletionMtimeMs = stats.mtimeMs;
 			clearActiveOwnerIfCurrent();
 			applyUi();
-			if (outcome.status === "error") {
+			recordDictation(outcome.status, text, outcome.status === "error" ? String(outcome.message || "unknown error") : undefined);
+			if (currentCtx.hasUI && outcome.status === "error") {
 				currentCtx.ui.notify(`Voice transcription failed: ${outcome.message || "unknown error"}`, "error");
-			} else if (outcome.status === "empty") {
+			} else if (currentCtx.hasUI && outcome.status === "empty") {
 				currentCtx.ui.notify("No speech detected", "info");
-			} else {
-				sendTranscript(text);
 			}
 		} catch {
 			// No completion yet (or a failed read); retry on the next poll.
@@ -316,7 +359,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 		armInboxSnapshot();
 	};
 
-	const checkFileTransport = async (): Promise<string | undefined> => {
+	const checkFileTransport = async (captureMetadata = false): Promise<string | undefined> => {
 		const result = await runShellCommand("voxtype config schema --json");
 		if (!result.ok) return "Voxtype >=1.0 is required for completed transcript delivery.";
 		try {
@@ -330,7 +373,18 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			const streaming = (schema.engine === "parakeet" && value("parakeet.streaming") === true)
 				|| (schema.engine === "soniox" && value("soniox.async_api") !== true);
 			if (streaming && schema.capabilities?.streaming_file_output !== true) {
-				return "This Voxtype build bypasses --file when streaming. Use the streaming-file-output compatibility build or a non-streaming model.";
+				return "This Voxtype build does not advertise verified streaming file completion. Use the streaming-file-output compatibility build or a non-streaming model.";
+			}
+			if (captureMetadata) {
+				recordingMetadata = {
+					version: schema.voxtype_version,
+					engine: schema.engine,
+					model: value(`${schema.engine}.model`),
+					textSettings: Object.fromEntries((schema.keys || [])
+						.filter((entry: { key: string }) => entry.key.startsWith("text."))
+						.map((entry: { key: string; value: unknown }) => [entry.key, entry.value])),
+					replacements: schema.replacements || {},
+				};
 			}
 		} catch {
 			return "Cannot read Voxtype's config schema; refusing to start an unverified file recording.";
@@ -387,7 +441,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 		commandInFlight = true;
 		try {
 			if (action === "start") {
-				const issue = await checkFileTransport();
+				const issue = await checkFileTransport(true);
 				if (disposed) return;
 				if (issue) {
 					ctx.ui.notify(issue, "warning");
@@ -404,7 +458,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			enabled = true;
 			persistConfig();
 			const command = action === "start"
-				? `voxtype record start --no-auto-submit --file=${shQuote(inboxFile)}`
+				? `voxtype record start --no-auto-submit --no-smart-auto-submit --no-osd --file=${shQuote(inboxFile)}`
 				: "voxtype record stop";
 			const result = await runShellCommand(command);
 			if (disposed) {
@@ -441,6 +495,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			return { issues, notes, actions };
 		}
 		notes.push("voxtype found on PATH.");
+		notes.push(`always-on dictation history: ${getHistoryDir()} (text only)`);
 		const transportIssue = await checkFileTransport();
 		if (transportIssue) issues.push(transportIssue);
 		else notes.push("Completed file transcript delivery is supported by the running daemon.");
@@ -478,6 +533,16 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 
 	const shortcutLabel = () => (DEFAULT_SHORTCUT.toLowerCase() === "off" ? "disabled" : DEFAULT_SHORTCUT);
 
+	pi.registerEntryRenderer<DictationRecord>(DICTATION_ENTRY, (entry, { expanded }, theme) => {
+		const record = entry.data;
+		if (!record) return undefined;
+		const status = record.outcome !== "ok" ? record.outcome
+			: record.delivery === "queued" ? `queued ${record.busyMode}` : record.delivery;
+		const heading = `🎙 Dictation · ${status} · ${record.timestamp.slice(11, 19)} UTC`;
+		const details = expanded ? `\n${displayText(record.transcript || record.error || "No speech detected")}\nHistory ID: ${record.id}` : "";
+		return new Text(theme.fg("accent", heading) + details, 1, 0);
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
 		loadConfig(ctx);
@@ -511,7 +576,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 	pi.registerCommand("voice", {
 		description: "Bridge voxtype transcripts into pi",
 		getArgumentCompletions: (prefix) => {
-			const args = ["status", "toggle", "cancel", "on", "off", "doctor", "steer", "followup"];
+			const args = ["status", "toggle", "cancel", "on", "off", "doctor", "history", "steer", "followup"];
 			const filtered = args.filter((value) => value.startsWith(prefix.trim().toLowerCase()));
 			return filtered.length > 0 ? filtered.map((value) => ({ value, label: value })) : null;
 		},
@@ -519,8 +584,27 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 			currentCtx = ctx;
 			ensurePolling();
 
-			const [command = "status"] = args.trim().split(/\s+/).filter(Boolean);
+			const [command = "status", ...rest] = args.trim().split(/\s+/).filter(Boolean);
 			switch (command.toLowerCase()) {
+				case "history": {
+					const count = rest.length === 0 ? 10 : Number(rest[0]);
+					if (rest.length > 1 || !Number.isInteger(count) || count < 1 || count > 50) {
+						ctx.ui.notify("Usage: /voice history [1-50]", "warning");
+						return;
+					}
+					try {
+						const records = readRecentHistory(count);
+						const lines = records.map((record) => {
+							const text = displayText(record.transcript || record.error || "No speech detected");
+							const preview = text.length > 1000 ? text.slice(0, 1000) + "…" : text;
+							return `${record.timestamp} · ${record.outcome}/${record.delivery} · ${record.id.slice(0, 8)}\n${preview}`;
+						});
+						ctx.ui.notify(`Dictation history (${records.length} newest, across Pi sessions)\n${getHistoryDir()}\n\n${lines.join("\n\n") || "No dictation recorded yet."}`, "info");
+					} catch (error) {
+						ctx.ui.notify(`Cannot read dictation history: ${error}`, "error");
+					}
+					return;
+				}
 				case "toggle": {
 					await toggleRecording(ctx);
 					return;
@@ -573,7 +657,7 @@ export default function piVoiceExtension(pi: ExtensionAPI) {
 				case "status":
 				default: {
 					ctx.ui.notify(
-						`Voice ${enabled ? "on" : "off"}. Shortcut: ${shortcutLabel()}. Voxtype: ${voxtypeState}. Busy: ${busyMode === "followUp" ? "follow-up" : "steer"}. Inbox: ${inboxFile}. State file: ${voxtypeStateFile || "disabled"}.`,
+						`Voice ${enabled ? "on" : "off"}. Shortcut: ${shortcutLabel()}. Voxtype: ${voxtypeState}. Busy: ${busyMode === "followUp" ? "follow-up" : "steer"}. Inbox: ${inboxFile}. State file: ${voxtypeStateFile || "disabled"}. History (always on): ${getHistoryDir()}.`,
 						"info",
 					);
 					applyUi();

@@ -3,17 +3,20 @@ import { after, test } from "node:test";
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { loadExtension } from "./load-extension.mjs";
+import { getHistoryDir, readRecentHistory } from "../history.ts";
 
 // Never touch the real daemon, microphone, pi session, or user's inbox.
 const root = mkdtempSync(join(tmpdir(), "pi-voxtype-test-"));
 process.env.XDG_RUNTIME_DIR = join(root, "runtime");
 process.env.HOME = join(root, "home");
+process.env.XDG_STATE_HOME = join(root, "state");
 delete process.env.PI_VOXTYPE_INBOX;
-const { default: extension } = await import("../index.ts");
+const extension = await loadExtension();
 after(() => rmSync(root, { recursive: true, force: true }));
 
 async function harness(t, options = {}) {
-	for (const dir of [process.env.XDG_RUNTIME_DIR, process.env.HOME]) {
+	for (const dir of [process.env.XDG_RUNTIME_DIR, process.env.HOME, process.env.XDG_STATE_HOME]) {
 		rmSync(dir, { recursive: true, force: true });
 		mkdirSync(dir, { recursive: true });
 	}
@@ -33,17 +36,28 @@ async function harness(t, options = {}) {
 		return id;
 	});
 	t.mock.method(globalThis, "clearInterval", (id) => callbacks.delete(id));
-	const commands = [], sent = [], notices = [], events = new Map(), slash = new Map();
+	const commands = [], sent = [], notices = [], entries = [], labels = [], renderers = new Map(), events = new Map(), slash = new Map();
 	const schema = {
 		voxtype_version: "1.0.1+pi.1", daemon_version: "1.0.1+pi.1",
 		capabilities: { streaming_file_output: true },
-		engine: "parakeet", keys: [{ key: "parakeet.streaming", value: true }],
+		engine: "parakeet", replacements: { "vox type": "Voxtype" },
+		keys: [
+			{ key: "parakeet.streaming", value: true },
+			{ key: "parakeet.model", value: "parakeet-unified-en-0.6b" },
+			{ key: "text.spoken_punctuation", value: false },
+		],
 		...options.schema,
 	};
 	const ctx = {
-		hasUI: true,
+		hasUI: options.hasUI ?? true,
+		cwd: "/test/project",
 		isIdle: () => !busy,
-		sessionManager: { getSessionFile: () => "/test/session.jsonl", getBranch: () => [] },
+		sessionManager: {
+			getSessionFile: () => options.sessionFile ?? "/test/session.jsonl",
+			getSessionId: () => "test-session-id",
+			getLeafId: () => entries.at(-1)?.id ?? null,
+			getBranch: () => entries,
+		},
 		ui: {
 			setStatus() {}, setWidget() {},
 			notify: (text, level) => notices.push({ text, level }),
@@ -53,8 +67,16 @@ async function harness(t, options = {}) {
 		on: (name, fn) => events.set(name, fn),
 		registerShortcut() {},
 		registerCommand: (name, spec) => slash.set(name, spec),
-		appendEntry() {},
-		sendUserMessage: (text, delivery) => sent.push({ text, delivery }),
+		registerEntryRenderer: (type, renderer) => renderers.set(type, renderer),
+		setLabel: (id, label) => labels.push({ id, label }),
+		appendEntry: (customType, data) => {
+			if (options.markerError && customType === "pi-voxtype-dictation") throw new Error("Cannot save marker");
+			entries.push({ type: "custom", id: String(entries.length), customType, data });
+		},
+		sendUserMessage: (text, delivery) => {
+			if (options.sendError) throw new Error("Send refused");
+			sent.push({ text, delivery });
+		},
 		exec: async (_program, args) => {
 			const command = args[1];
 			commands.push(command);
@@ -96,7 +118,9 @@ async function harness(t, options = {}) {
 	};
 	return {
 		voice, poll, owner, complete, shutdown, setState, stateFile, ownerFile,
-		commands, sent, notices, schema, callbacks,
+		commands, sent, notices, schema, callbacks, entries, labels, renderers,
+		history: () => readRecentHistory(50),
+		markers: () => entries.filter((entry) => entry.customType === "pi-voxtype-dictation"),
 		setBusy: (value) => { busy = value; },
 		recordCommands: () => commands.filter((c) => c.startsWith("voxtype record")),
 	};
@@ -105,7 +129,7 @@ async function harness(t, options = {}) {
 test("start -> stop -> completed transcript submits exactly one full message", async (t) => {
 	const h = await harness(t);
 	await h.voice("toggle");
-	assert.match(h.recordCommands()[0], /start --no-auto-submit --file=/);
+	assert.match(h.recordCommands()[0], /start --no-auto-submit --no-smart-auto-submit --no-osd --file=/);
 	writeFileSync(h.owner().inboxFile, "unfinished partial");
 	h.poll();
 	assert.equal(h.sent.length, 0);
@@ -129,7 +153,28 @@ test("unpatched streaming daemon is refused before any recording or inbox write"
 	const h = await harness(t, { schema: { capabilities: undefined } });
 	await h.voice("toggle");
 	assert.equal(h.recordCommands().length, 0);
-	assert.match(h.notices.at(-1).text, /bypasses --file/);
+	assert.match(h.notices.at(-1).text, /verified streaming file completion/);
+});
+
+test("stock 1.1.0 stays blocked because streaming omits the completion sidecar", async (t) => {
+	const h = await harness(t, { schema: {
+		voxtype_version: "1.1.0", daemon_version: "1.1.0", capabilities: undefined,
+	} });
+	await h.voice("toggle");
+	assert.equal(h.recordCommands().length, 0);
+	assert.match(h.notices.at(-1).text, /verified streaming file completion/);
+});
+
+test("1.1.0 compatibility build advertises the verified completion contract", async (t) => {
+	const h = await harness(t, { schema: {
+		voxtype_version: "1.1.0+pi.1", daemon_version: "1.1.0+pi.1",
+	} });
+	await h.voice("toggle");
+	h.setState("streaming");
+	await h.voice("toggle");
+	h.complete("Native streaming transcript");
+	h.poll();
+	assert.deepEqual(h.sent.map((s) => s.text), ["Native streaming transcript"]);
 });
 
 test("CLI/daemon version mismatch fails closed", async (t) => {
@@ -274,4 +319,127 @@ test("start command failure clears ownership and reports the error", async (t) =
 	await h.voice("toggle");
 	assert.equal(readFileSync(h.ownerFile, "utf8"), "");
 	assert.match(h.notices.at(-1).text, /failed to signal/);
+});
+
+test("always-on history preserves final Voxtype text, metadata, and the unmodified submitted message", async (t) => {
+	const h = await harness(t);
+	await h.voice("toggle");
+	h.complete("  Fix Voxtype please.\n");
+	h.poll(); h.poll();
+	const [record] = h.history();
+	assert.equal(h.history().length, 1);
+	assert.equal(record.transcript, "  Fix Voxtype please.\n");
+	assert.equal(record.submittedText, "Fix Voxtype please.");
+	assert.equal(record.source, "dictation");
+	assert.equal(record.scope, "pi");
+	assert.equal(record.sessionFile, "/test/session.jsonl");
+	assert.equal(record.sessionId, "test-session-id");
+	assert.equal(record.cwd, "/test/project");
+	assert.equal(record.outcome, "ok");
+	assert.equal(record.delivery, "submitted");
+	assert.equal(record.voxtype.model, "parakeet-unified-en-0.6b");
+	assert.deepEqual(record.voxtype.replacements, { "vox type": "Voxtype" });
+	assert.equal(record.voxtype.textSettings["text.spoken_punctuation"], false);
+	assert.equal("rawTranscript" in record, false);
+	assert.deepEqual(h.sent, [{ text: "Fix Voxtype please.", delivery: undefined }]);
+	assert.equal(h.markers().length, 1);
+	assert.equal(h.markers()[0].data.id, record.id);
+	assert.equal(h.labels.at(-1).label, "🎙 Dictation");
+});
+
+test("dictation markers render a compact label and expand without adding labels to model input", async (t) => {
+	const h = await harness(t);
+	await h.voice("toggle");
+	h.complete("A dictated sentence"); h.poll();
+	const marker = h.markers()[0];
+	const render = h.renderers.get("pi-voxtype-dictation");
+	const theme = { fg: (_color, text) => text };
+	assert.match(render(marker, { expanded: false }, theme).text, /🎙 Dictation · submitted/);
+	assert.doesNotMatch(render(marker, { expanded: false }, theme).text, /A dictated sentence/);
+	assert.match(render(marker, { expanded: true }, theme).text, /A dictated sentence/);
+	assert.equal(h.sent[0].text, "A dictated sentence");
+});
+
+test("queued steering and follow-up dictation get distinct history records without claiming delivery", async (t) => {
+	const h = await harness(t);
+	h.setBusy(true);
+	for (const mode of ["steer", "followup"]) {
+		await h.voice(mode);
+		await h.voice("toggle");
+		h.complete("Same words"); h.poll();
+	}
+	const history = h.history();
+	assert.equal(history.length, 2);
+	assert.notEqual(history[0].id, history[1].id);
+	assert.deepEqual(history.map((record) => record.busyMode), ["followUp", "steer"]);
+	assert.ok(history.every((record) => record.delivery === "queued"));
+	assert.equal(h.markers().length, 2);
+});
+
+test("empty/error outcomes are recorded without being sent, and cancelled partial audio is not archived", async (t) => {
+	const h = await harness(t);
+	for (const outcome of ["empty", "error"]) {
+		await h.voice("toggle"); h.complete("", outcome); h.poll();
+	}
+	assert.equal(h.history().length, 2);
+	assert.deepEqual(h.history().map((record) => record.outcome), ["error", "empty"]);
+	assert.ok(h.history().every((record) => record.delivery === "not-submitted"));
+	assert.equal(h.history()[0].error, "test failure");
+	await h.voice("toggle");
+	writeFileSync(h.owner().inboxFile, "private cancelled partial");
+	await h.voice("cancel"); h.poll();
+	assert.equal(h.history().length, 2);
+	assert.equal(h.sent.length, 0);
+});
+
+test("history write failures warn once without breaking dictation or its session markers", async (t) => {
+	const h = await harness(t);
+	writeFileSync(join(process.env.XDG_STATE_HOME, "pi-voxtype"), "blocked");
+	for (let i = 0; i < 2; i++) {
+		await h.voice("toggle"); h.complete("Still delivered"); h.poll();
+	}
+	assert.equal(h.sent.length, 2);
+	assert.equal(h.markers().length, 2);
+	assert.equal(h.notices.filter((notice) => notice.text.includes("Could not save dictation history")).length, 1);
+});
+
+test("session marker failures do not prevent private logging or voice delivery", async (t) => {
+	const h = await harness(t, { markerError: true });
+	await h.voice("toggle"); h.complete("Still delivered"); h.poll();
+	assert.equal(h.sent.length, 1);
+	assert.equal(h.history().length, 1);
+	assert.ok(h.notices.some((notice) => notice.text.includes("Could not save dictation session marker")));
+});
+
+test("synchronous Pi send failures preserve the transcript and failure status", async (t) => {
+	const h = await harness(t, { sendError: true });
+	await h.voice("toggle"); h.complete("Please keep this failed transcript"); h.poll();
+	assert.equal(h.sent.length, 0);
+	assert.equal(h.history()[0].delivery, "failed");
+	assert.equal(h.history()[0].transcript, "Please keep this failed transcript");
+	assert.equal(h.history()[0].submittedText, "");
+	assert.equal(h.history()[0].error, "Send refused");
+});
+
+test("history is always recorded without an interactive UI", async (t) => {
+	const h = await harness(t, { hasUI: false });
+	await h.voice("toggle"); h.complete("Headless dictation"); h.poll();
+	assert.equal(h.history()[0].submittedText, "Headless dictation");
+	assert.equal(h.markers().length, 1);
+});
+
+test("/voice history reviews records and validates its bounded count", async (t) => {
+	const h = await harness(t);
+	await h.voice("history");
+	assert.match(h.notices.at(-1).text, /No dictation recorded yet/);
+	await h.voice("toggle"); h.complete("Review this mistake"); h.poll();
+	await h.voice("history 1");
+	assert.match(h.notices.at(-1).text, /Review this mistake/);
+	assert.match(h.notices.at(-1).text, /1 newest/);
+	assert.ok(h.notices.at(-1).text.includes(getHistoryDir()));
+	for (const argument of ["0", "51", "abc", "1 extra"]) {
+		await h.voice("history " + argument);
+		assert.equal(h.notices.at(-1).level, "warning");
+		assert.match(h.notices.at(-1).text, /Usage:/);
+	}
 });
